@@ -18,3 +18,6 @@ pyfarm = "pyfarm.cli.main:cli"
 
 [project.optional-dependencies]
 dev = ["pytest", "pytest-asyncio"]
+
+[tool.hatch.build.targets.wheel]
+packages = ["pyfarm"]
