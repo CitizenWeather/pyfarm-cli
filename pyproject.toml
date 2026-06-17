@@ -11,6 +11,7 @@ dependencies = [
     "pyfarm-core",
     "pyfarm-control",
     "click>=8.0",
+    "httpx>=0.25",
 ]
 
 [project.scripts]
@@ -18,3 +19,6 @@ pyfarm = "pyfarm.cli.main:cli"
 
 [project.optional-dependencies]
 dev = ["pytest", "pytest-asyncio"]
+
+[tool.hatch.build.targets.wheel]
+packages = ["pyfarm"]

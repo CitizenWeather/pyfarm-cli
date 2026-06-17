@@ -32,10 +32,12 @@ def validate(spec_path: Path) -> None:
 @click.argument("spec_path", type=click.Path(exists=True, path_type=Path))
 @click.option("--chamber", default=None, help="Chamber identifier (future: loads sensor config)")
 @click.option("--tick", default=10, show_default=True, help="Control loop interval in seconds")
-def start(spec_path: Path, chamber: str | None, tick: int) -> None:
+@click.option("--api-port", default=None, type=int, help="Expose live status API on this port")
+def start(spec_path: Path, chamber: str | None, tick: int, api_port: int | None) -> None:
     """Start a grow run from a GrowSpec YAML file."""
+    from pyfarm.core.models import EventKind
     from pyfarm.control.spec.loader import load_spec, SpecLoadError
-    from pyfarm.control.actuators.logging_actuator import LoggingActuator
+    from pyfarm.control.extensions import build_actuator, build_notifiers, NotifierSink
     from pyfarm.control.engine.runner import ControlRunner
 
     try:
@@ -49,10 +51,32 @@ def start(spec_path: Path, chamber: str | None, tick: int) -> None:
     if chamber:
         click.echo(f"Chamber: {chamber}")
     click.echo(f"Tick:    {tick}s")
+    if api_port:
+        click.echo(f"API:     http://127.0.0.1:{api_port}/status")
+
+    # Build actuators and notification channels from the spec via the registry.
+    actuators = {
+        name: build_actuator(name, actuator_spec)
+        for name, actuator_spec in spec.actuators.items()
+    }
+    notifiers = build_notifiers(spec.notifications)
+    notifier_sink = None
+    if notifiers:
+        # Alerts route by their own `channels`; sensor failures fan out to all channels.
+        notifier_sink = NotifierSink(
+            notifiers, default_routing={EventKind.SENSOR_FAILURE: list(notifiers)}
+        )
+        click.echo(f"Notify:  {', '.join(notifiers)}")
     click.echo("Starting control loop (Ctrl+C to stop)...\n")
 
-    actuators = {name: LoggingActuator(name) for name in spec.actuators}
-    runner = ControlRunner(spec=spec, sensors=[], actuators=actuators, tick_seconds=tick)
+    runner = ControlRunner(
+        spec=spec,
+        sensors=[],
+        actuators=actuators,
+        notifier=notifier_sink,
+        tick_seconds=tick,
+        api_port=api_port,
+    )
 
     try:
         asyncio.run(runner.run())
@@ -91,9 +115,37 @@ def replay(spec_path: Path, sensor_csv: Path, metrics: str) -> None:
 
 
 @grow.command("status")
-@click.argument("chamber", default="default")
-def status(chamber: str) -> None:
-    """Show live status of a running grow (requires local API)."""
-    # Stub: will query the local FastAPI instance once the API layer is built
-    click.echo(f"Chamber: {chamber}")
-    click.echo("Status API not yet implemented. Start a run with 'pyfarm grow start'.")
+@click.option("--port", default=8765, show_default=True, help="Port the control API is listening on")
+def status(port: int) -> None:
+    """Show live status of a running grow."""
+    import httpx
+
+    url = f"http://127.0.0.1:{port}/status"
+    try:
+        resp = httpx.get(url, timeout=5.0)
+        resp.raise_for_status()
+    except httpx.ConnectError:
+        click.echo(f"Could not connect to API at {url}. Is a run active? (use 'pyfarm grow start --api-port {port}')", err=True)
+        raise SystemExit(1)
+    except httpx.HTTPStatusError as e:
+        click.echo(f"API error: {e}", err=True)
+        raise SystemExit(1)
+
+    import json
+    data = resp.json()
+    click.echo(f"Run:     {data['run_id']}")
+    click.echo(f"Spec:    {data['spec_name']}")
+    click.echo(f"Stage:   {data['current_stage']} ({data['elapsed_days']:.2f} days)")
+    if data["readings"]:
+        click.echo("Sensors:")
+        for m, r in data["readings"].items():
+            stale = " [STALE]" if r["stale"] else ""
+            click.echo(f"  {m}: {r['value']} {r['unit']}{stale}")
+    if data["derived"]:
+        click.echo("Derived:")
+        for k, v in data["derived"].items():
+            click.echo(f"  {k}: {v:.3f}")
+    if data["recent_events"]:
+        click.echo("Recent events:")
+        for ev in data["recent_events"][-5:]:
+            click.echo(f"  [{ev['kind']}] {ev['message']}")
