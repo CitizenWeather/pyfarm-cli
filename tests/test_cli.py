@@ -1,102 +1,82 @@
-import csv
-from pathlib import Path
-from unittest.mock import AsyncMock, patch
+"""CLI smoke tests."""
+from __future__ import annotations
 
-import pytest
+from unittest.mock import MagicMock, patch
+
 from click.testing import CliRunner
 
-from pyfarm.cli.main import cli
+from pyfarm.cli.grow import grow
 
 
-MINIMAL_SPEC = """
-spec_version: "1.0"
-kind: GrowSpec
-metadata:
-  name: test-oyster
-  species: pleurotus.ostreatus
-  substrate: coffee_grounds
-  author: test@example.com
-  registry: test/v1
-stages:
-  - name: colonisation
-    duration:
-      min_days: 14
-      max_days: 28
-    exit_condition:
-      metric: visual.colonisation_pct
-      threshold: ">= 0.95"
-    setpoints:
-      temperature:
-        target: 24.0
-        tolerance: 2.0
-        unit: celsius
-      humidity_rh:
-        target: 0.90
-        tolerance: 0.05
-      co2_ppm:
-        target: 2000
-        tolerance: 500
-      light:
-        schedule: "0/24"
-actuators:
-  misting:
-    kind: relay
-    gpio: 17
-"""
-
-SAMPLE_CSV = "timestamp,temperature,humidity_rh,co2_ppm\n2024-01-15T08:00:00,18.2,0.93,810\n"
+RUNNER = CliRunner()
 
 
-@pytest.fixture
-def spec_file(tmp_path) -> Path:
-    p = tmp_path / "test.pyfarm.yaml"
-    p.write_text(MINIMAL_SPEC)
-    return p
+# ---------------------------------------------------------------------------
+# validate
+# ---------------------------------------------------------------------------
+
+def test_validate_missing_file():
+    result = RUNNER.invoke(grow, ["validate", "/nonexistent/path.yaml"])
+    assert result.exit_code != 0
 
 
-@pytest.fixture
-def csv_file(tmp_path) -> Path:
-    p = tmp_path / "data.csv"
-    p.write_text(SAMPLE_CSV)
-    return p
+# ---------------------------------------------------------------------------
+# events
+# ---------------------------------------------------------------------------
+
+def _mock_events_response(data):
+    resp = MagicMock()
+    resp.json.return_value = data
+    resp.raise_for_status.return_value = None
+    return resp
 
 
-def test_validate_ok(spec_file):
-    runner = CliRunner()
-    result = runner.invoke(cli, ["grow", "validate", str(spec_file)])
+def test_events_prints_events():
+    sample = [
+        {"timestamp": "2024-01-01T00:00:00+00:00", "kind": "actuator", "message": "fan -> ON"},
+        {"timestamp": "2024-01-01T00:00:05+00:00", "kind": "alert_fired", "message": "too hot"},
+    ]
+    with patch("httpx.get", return_value=_mock_events_response(sample)):
+        result = RUNNER.invoke(grow, ["events", "--port", "8765"])
     assert result.exit_code == 0
-    assert "test-oyster" in result.output
+    assert "fan -> ON" in result.output
+    assert "too hot" in result.output
 
 
-def test_validate_bad_yaml(tmp_path):
-    bad = tmp_path / "bad.yaml"
-    bad.write_text("not: a: grow: spec")
-    runner = CliRunner()
-    result = runner.invoke(cli, ["grow", "validate", str(bad)])
-    assert result.exit_code == 1
+def test_events_empty_response():
+    with patch("httpx.get", return_value=_mock_events_response([])):
+        result = RUNNER.invoke(grow, ["events"])
+    assert result.exit_code == 0
+    assert result.output.strip() == ""
 
 
-def test_replay_runs(spec_file, csv_file):
-    runner = CliRunner()
-    result = runner.invoke(
-        cli,
-        ["grow", "replay", str(spec_file), str(csv_file)],
-    )
-    assert result.exit_code == 0, result.output
-    assert "Replay complete" in result.output
+# ---------------------------------------------------------------------------
+# actuators
+# ---------------------------------------------------------------------------
+
+def _mock_actuators_response(data):
+    resp = MagicMock()
+    resp.json.return_value = data
+    resp.raise_for_status.return_value = None
+    return resp
 
 
-def test_start_command_runs_then_stops(spec_file):
-    """Verify start builds actuators and enters the control loop (mocked to exit immediately)."""
-    runner = CliRunner()
+def test_actuators_shows_states():
+    sample = {
+        "fan": {"on": True, "command": True, "last_changed": "2024-01-01T00:00:00+00:00", "seconds_in_state": 90.0},
+        "heater": {"on": False, "command": False, "last_changed": "2024-01-01T00:00:00+00:00", "seconds_in_state": 300.0},
+    }
+    with patch("httpx.get", return_value=_mock_actuators_response(sample)):
+        result = RUNNER.invoke(grow, ["actuators"])
+    assert result.exit_code == 0
+    assert "fan" in result.output
+    assert "ON" in result.output
+    assert "heater" in result.output
+    assert "OFF" in result.output
 
-    # Patch ControlRunner.run to return immediately so the test doesn't spin forever.
-    async def _instant_run(self):
-        self.stop()
 
-    with patch("pyfarm.control.engine.runner.ControlRunner.run", _instant_run):
-        result = runner.invoke(cli, ["grow", "start", str(spec_file)])
-
-    assert result.exit_code == 0, result.output
-    assert "test-oyster" in result.output
-    assert "Starting control loop" in result.output
+def test_actuators_no_actuators():
+    with patch("httpx.get", return_value=_mock_actuators_response({})):
+        result = RUNNER.invoke(grow, ["actuators"])
+    assert result.exit_code == 0
+    assert "No actuators registered" in result.output

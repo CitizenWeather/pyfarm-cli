@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import time
 from pathlib import Path
 
 import click
@@ -148,3 +149,95 @@ def status(port: int) -> None:
         click.echo("Recent events:")
         for ev in data["recent_events"][-5:]:
             click.echo(f"  [{ev['kind']}] {ev['message']}")
+
+
+@grow.command("events")
+@click.option("--port", default=8765, show_default=True, help="Port the control API is listening on")
+@click.option("--since", default=None, help="ISO-8601 timestamp; show only events after this time")
+@click.option("--follow", is_flag=True, help="Poll continuously and stream new events (Ctrl-C to stop)")
+@click.option("--interval", default=2.0, show_default=True, help="Poll interval in seconds (--follow mode)")
+def events(port: int, since: str | None, follow: bool, interval: float) -> None:
+    """Stream control events from a running grow.
+
+    Without --follow, prints all events (optionally filtered by --since) and
+    exits.  With --follow, polls the API every --interval seconds and prints
+    new events as they arrive until interrupted.
+    """
+    import httpx
+
+    base_url = f"http://127.0.0.1:{port}/events"
+
+    def _fetch(after: str | None = None) -> list[dict]:
+        params = {"since": after} if after else {}
+        try:
+            resp = httpx.get(base_url, params=params, timeout=5.0)
+            resp.raise_for_status()
+            return resp.json()
+        except httpx.ConnectError:
+            click.echo(
+                f"Could not connect to API at {base_url}. Is a run active? "
+                f"(use 'pyfarm grow start --api-port {port}')",
+                err=True,
+            )
+            raise SystemExit(1)
+        except httpx.HTTPStatusError as e:
+            click.echo(f"API error: {e}", err=True)
+            raise SystemExit(1)
+
+    def _print_event(ev: dict) -> None:
+        click.echo(f"[{ev['timestamp']}] {ev['kind']}: {ev['message']}")
+
+    batch = _fetch(since)
+    for ev in batch:
+        _print_event(ev)
+
+    if not follow:
+        return
+
+    last_ts = batch[-1]["timestamp"] if batch else since
+    try:
+        while True:
+            time.sleep(interval)
+            new_events = _fetch(last_ts)
+            for ev in new_events:
+                _print_event(ev)
+            if new_events:
+                last_ts = new_events[-1]["timestamp"]
+    except KeyboardInterrupt:
+        pass
+
+
+@grow.command("actuators")
+@click.option("--port", default=8765, show_default=True, help="Port the control API is listening on")
+def actuators(port: int) -> None:
+    """Show current actuator states from a running grow."""
+    import httpx
+
+    url = f"http://127.0.0.1:{port}/actuators"
+    try:
+        resp = httpx.get(url, timeout=5.0)
+        resp.raise_for_status()
+    except httpx.ConnectError:
+        click.echo(
+            f"Could not connect to API at {url}. Is a run active? "
+            f"(use 'pyfarm grow start --api-port {port}')",
+            err=True,
+        )
+        raise SystemExit(1)
+    except httpx.HTTPStatusError as e:
+        click.echo(f"API error: {e}", err=True)
+        raise SystemExit(1)
+
+    data = resp.json()
+    if not data:
+        click.echo("No actuators registered.")
+        return
+
+    click.echo("Actuators:")
+    for name, state in data.items():
+        on_str = "ON " if state["on"] else "OFF"
+        secs = state.get("seconds_in_state", 0)
+        mins, s = divmod(int(secs), 60)
+        hrs, m = divmod(mins, 60)
+        duration = f"{hrs}h {m:02d}m {s:02d}s" if hrs else f"{m}m {s:02d}s"
+        click.echo(f"  {name}: {on_str}  ({duration} in this state)")
