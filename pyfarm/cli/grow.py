@@ -35,8 +35,9 @@ def validate(spec_path: Path) -> None:
 @click.option("--api-port", default=None, type=int, help="Expose live status API on this port")
 def start(spec_path: Path, chamber: str | None, tick: int, api_port: int | None) -> None:
     """Start a grow run from a GrowSpec YAML file."""
+    from pyfarm.core.models import EventKind
     from pyfarm.control.spec.loader import load_spec, SpecLoadError
-    from pyfarm.control.actuators.logging_actuator import LoggingActuator
+    from pyfarm.control.extensions import build_actuator, build_notifiers, NotifierSink
     from pyfarm.control.engine.runner import ControlRunner
 
     try:
@@ -52,10 +53,30 @@ def start(spec_path: Path, chamber: str | None, tick: int, api_port: int | None)
     click.echo(f"Tick:    {tick}s")
     if api_port:
         click.echo(f"API:     http://127.0.0.1:{api_port}/status")
+
+    # Build actuators and notification channels from the spec via the registry.
+    actuators = {
+        name: build_actuator(name, actuator_spec)
+        for name, actuator_spec in spec.actuators.items()
+    }
+    notifiers = build_notifiers(spec.notifications)
+    notifier_sink = None
+    if notifiers:
+        # Alerts route by their own `channels`; sensor failures fan out to all channels.
+        notifier_sink = NotifierSink(
+            notifiers, default_routing={EventKind.SENSOR_FAILURE: list(notifiers)}
+        )
+        click.echo(f"Notify:  {', '.join(notifiers)}")
     click.echo("Starting control loop (Ctrl+C to stop)...\n")
 
-    actuators = {name: LoggingActuator(name) for name in spec.actuators}
-    runner = ControlRunner(spec=spec, sensors=[], actuators=actuators, tick_seconds=tick, api_port=api_port)
+    runner = ControlRunner(
+        spec=spec,
+        sensors=[],
+        actuators=actuators,
+        notifier=notifier_sink,
+        tick_seconds=tick,
+        api_port=api_port,
+    )
 
     try:
         asyncio.run(runner.run())
