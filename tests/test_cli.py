@@ -1,5 +1,6 @@
 import csv
 from pathlib import Path
+from unittest.mock import AsyncMock, patch
 
 import pytest
 from click.testing import CliRunner
@@ -12,6 +13,10 @@ spec_version: "1.0"
 kind: GrowSpec
 metadata:
   name: test-oyster
+  species: pleurotus.ostreatus
+  substrate: coffee_grounds
+  author: test@example.com
+  registry: test/v1
 stages:
   - name: colonisation
     duration:
@@ -24,9 +29,15 @@ stages:
       temperature:
         target: 24.0
         tolerance: 2.0
+        unit: celsius
       humidity_rh:
         target: 0.90
         tolerance: 0.05
+      co2_ppm:
+        target: 2000
+        tolerance: 500
+      light:
+        schedule: "0/24"
 actuators:
   misting:
     kind: relay
@@ -71,5 +82,21 @@ def test_replay_runs(spec_file, csv_file):
         cli,
         ["grow", "replay", str(spec_file), str(csv_file)],
     )
-    assert result.exit_code == 0
+    assert result.exit_code == 0, result.output
     assert "Replay complete" in result.output
+
+
+def test_start_command_runs_then_stops(spec_file):
+    """Verify start builds actuators and enters the control loop (mocked to exit immediately)."""
+    runner = CliRunner()
+
+    # Patch ControlRunner.run to return immediately so the test doesn't spin forever.
+    async def _instant_run(self):
+        self.stop()
+
+    with patch("pyfarm.control.engine.runner.ControlRunner.run", _instant_run):
+        result = runner.invoke(cli, ["grow", "start", str(spec_file)])
+
+    assert result.exit_code == 0, result.output
+    assert "test-oyster" in result.output
+    assert "Starting control loop" in result.output
