@@ -33,7 +33,8 @@ def validate(spec_path: Path) -> None:
 @click.option("--chamber", default=None, help="Chamber identifier (future: loads sensor config)")
 @click.option("--tick", default=10, show_default=True, help="Control loop interval in seconds")
 @click.option("--api-port", default=None, type=int, help="Expose live status API on this port")
-def start(spec_path: Path, chamber: str | None, tick: int, api_port: int | None) -> None:
+@click.option("--db", default=None, help="SQLite database path for persistence and history")
+def start(spec_path: Path, chamber: str | None, tick: int, api_port: int | None, db: str | None) -> None:
     """Start a grow run from a GrowSpec YAML file."""
     from pyfarm.control.spec.loader import load_spec, SpecValidationError
     from pyfarm.control.extensions import build_actuator, build_notifiers, build_alert_evaluator
@@ -66,6 +67,13 @@ def start(spec_path: Path, chamber: str | None, tick: int, api_port: int | None)
     alert_evaluator = build_alert_evaluator(channels, spec)
     if channels:
         click.echo(f"Notify:  {', '.join(channels)}")
+
+    store = None
+    if db:
+        from pyfarm.control.persist import SQLiteStore
+        store = SQLiteStore(db)
+        click.echo(f"DB:      {db}")
+
     click.echo("Starting control loop (Ctrl+C to stop)...\n")
 
     runner = ControlRunner(
@@ -75,12 +83,15 @@ def start(spec_path: Path, chamber: str | None, tick: int, api_port: int | None)
         alert_evaluator=alert_evaluator,
         tick_seconds=tick,
         api_port=api_port,
+        store=store,
     )
 
     try:
         asyncio.run(runner.run())
     except KeyboardInterrupt:
         runner.stop()
+        if store is not None:
+            store.end_run(runner.ctx.run_id, runner.ctx.current_stage.name)
         click.echo("\nStopped.")
 
 
@@ -148,3 +159,86 @@ def status(port: int) -> None:
         click.echo("Recent events:")
         for ev in data["recent_events"][-5:]:
             click.echo(f"  [{ev['kind']}] {ev['message']}")
+
+
+@grow.command("export")
+@click.argument("run_id", type=str)
+@click.option("--db", default="pyfarm.db", show_default=True, help="SQLite database path")
+@click.option("--format", "export_format", type=click.Choice(["csv"]), default="csv", show_default=True)
+@click.option("--output", "-o", type=click.Path(), help="Output file (default: stdout)")
+def export(run_id: str, db: str, export_format: str, output: Path | None) -> None:
+    """Export a past grow run as CSV."""
+    from pyfarm.control.persist import SQLiteStore
+
+    store = SQLiteStore(db)
+    run = store.get_run(run_id)
+    if not run:
+        click.echo(f"Run '{run_id}' not found in {db}", err=True)
+        raise SystemExit(1)
+
+    readings = store.get_sensor_readings(run_id)
+    events = store.get_events(run_id)
+
+    lines: list[str] = []
+    lines.append(f"# Run: {run['run_id']}")
+    lines.append(f"# Spec: {run['spec_name']}")
+    lines.append(f"# Started: {run['started_at']}")
+    lines.append(f"# Ended: {run['ended_at']}")
+    lines.append("")
+    lines.append("## Sensor Readings")
+    lines.append("timestamp,metric,value,unit")
+    for r in readings:
+        lines.append(f"{r['timestamp']},{r['metric']},{r['value']},{r['unit']}")
+    lines.append("")
+    lines.append("## Events")
+    lines.append("timestamp,kind,message")
+    for e in events:
+        msg = e["message"].replace(",", ";").replace("\n", " ")
+        lines.append(f"{e['timestamp']},{e['kind']},{msg}")
+
+    csv_content = "\n".join(lines)
+
+    if output:
+        Path(output).write_text(csv_content)
+        click.echo(f"Exported to {output}")
+    else:
+        click.echo(csv_content)
+
+
+@grow.command("history")
+@click.argument("run_id", type=str)
+@click.option("--db", default="pyfarm.db", show_default=True, help="SQLite database path")
+def history(run_id: str, db: str) -> None:
+    """Show summary of a past grow run."""
+    from pyfarm.control.persist import SQLiteStore
+
+    store = SQLiteStore(db)
+    run = store.get_run(run_id)
+    if not run:
+        click.echo(f"Run '{run_id}' not found in {db}", err=True)
+        raise SystemExit(1)
+
+    click.echo(f"Run:     {run['run_id']}")
+    click.echo(f"Spec:    {run['spec_name']}")
+    click.echo(f"Started: {run['started_at']}")
+    click.echo(f"Ended:   {run['ended_at']}")
+    if run["final_stage"]:
+        click.echo(f"Final stage: {run['final_stage']}")
+
+    events = store.get_events(run_id)
+    alerts = [e for e in events if e["kind"] == "alert_fired"]
+    if alerts:
+        click.echo(f"\nAlerts ({len(alerts)}):")
+        for alert in alerts[-5:]:
+            click.echo(f"  - {alert['message']}")
+
+    readings = store.get_sensor_readings(run_id)
+    if readings:
+        metrics: dict[str, list[float]] = {}
+        for r in readings:
+            metrics.setdefault(r["metric"], []).append(r["value"])
+
+        click.echo("\nSensor Stats:")
+        for metric, values in metrics.items():
+            click.echo(f"  {metric}:")
+            click.echo(f"    min: {min(values):.2f}, max: {max(values):.2f}, avg: {sum(values)/len(values):.2f}")

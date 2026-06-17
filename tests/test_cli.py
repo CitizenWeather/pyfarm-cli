@@ -100,3 +100,34 @@ def test_start_command_runs_then_stops(spec_file):
     assert result.exit_code == 0, result.output
     assert "test-oyster" in result.output
     assert "Starting control loop" in result.output
+
+
+def test_export_and_history(tmp_path, spec_file):
+    """Verify export and history commands read from a pre-populated SQLite store."""
+    from pyfarm.control.persist import SQLiteStore
+
+    db_path = str(tmp_path / "test.db")
+    store = SQLiteStore(db_path)
+    run_id = "testrundemo"
+    store.new_run(run_id, "test-oyster")
+    store.end_run(run_id, "colonisation")
+
+    runner = CliRunner()
+
+    result = runner.invoke(cli, ["grow", "history", run_id, "--db", db_path])
+    assert result.exit_code == 0, result.output
+    assert run_id in result.output
+    assert "test-oyster" in result.output
+
+    result = runner.invoke(cli, ["grow", "export", run_id, "--db", db_path])
+    assert result.exit_code == 0, result.output
+    assert run_id in result.output
+    assert "## Sensor Readings" in result.output
+
+
+def test_history_missing_run(tmp_path):
+    """history exits with code 1 for an unknown run_id."""
+    db_path = str(tmp_path / "empty.db")
+    runner = CliRunner()
+    result = runner.invoke(cli, ["grow", "history", "nonexistent", "--db", db_path])
+    assert result.exit_code == 1
