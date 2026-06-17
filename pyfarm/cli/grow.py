@@ -16,11 +16,11 @@ def grow():
 @click.argument("spec_path", type=click.Path(exists=True, path_type=Path))
 def validate(spec_path: Path) -> None:
     """Validate a GrowSpec YAML file without starting a run."""
-    from pyfarm.control.spec.loader import load_spec, SpecLoadError
+    from pyfarm.control.spec.loader import load_spec, SpecValidationError
 
     try:
         spec = load_spec(spec_path)
-    except SpecLoadError as e:
+    except SpecValidationError as e:
         click.echo(f"✗ {e}", err=True)
         raise SystemExit(1)
 
@@ -35,14 +35,13 @@ def validate(spec_path: Path) -> None:
 @click.option("--api-port", default=None, type=int, help="Expose live status API on this port")
 def start(spec_path: Path, chamber: str | None, tick: int, api_port: int | None) -> None:
     """Start a grow run from a GrowSpec YAML file."""
-    from pyfarm.core.models import EventKind
-    from pyfarm.control.spec.loader import load_spec, SpecLoadError
-    from pyfarm.control.extensions import build_actuator, build_notifiers, NotifierSink
+    from pyfarm.control.spec.loader import load_spec, SpecValidationError
+    from pyfarm.control.extensions import build_actuator, build_notifiers, build_alert_evaluator
     from pyfarm.control.engine.runner import ControlRunner
 
     try:
         spec = load_spec(spec_path)
-    except SpecLoadError as e:
+    except SpecValidationError as e:
         click.echo(f"Error: {e}", err=True)
         raise SystemExit(1)
 
@@ -54,26 +53,26 @@ def start(spec_path: Path, chamber: str | None, tick: int, api_port: int | None)
     if api_port:
         click.echo(f"API:     http://127.0.0.1:{api_port}/status")
 
-    # Build actuators and notification channels from the spec via the registry.
-    actuators = {
-        name: build_actuator(name, actuator_spec)
-        for name, actuator_spec in spec.actuators.items()
-    }
-    notifiers = build_notifiers(spec.notifications)
-    notifier_sink = None
-    if notifiers:
-        # Alerts route by their own `channels`; sensor failures fan out to all channels.
-        notifier_sink = NotifierSink(
-            notifiers, default_routing={EventKind.SENSOR_FAILURE: list(notifiers)}
-        )
-        click.echo(f"Notify:  {', '.join(notifiers)}")
+    try:
+        actuators = {
+            name: build_actuator(name, actuator_spec)
+            for name, actuator_spec in spec.actuators.items()
+        }
+    except ValueError as e:
+        click.echo(f"Error building actuators: {e}", err=True)
+        raise SystemExit(1)
+
+    channels = build_notifiers(spec.notifications)
+    alert_evaluator = build_alert_evaluator(channels, spec)
+    if channels:
+        click.echo(f"Notify:  {', '.join(channels)}")
     click.echo("Starting control loop (Ctrl+C to stop)...\n")
 
     runner = ControlRunner(
         spec=spec,
         sensors=[],
         actuators=actuators,
-        notifier=notifier_sink,
+        alert_evaluator=alert_evaluator,
         tick_seconds=tick,
         api_port=api_port,
     )
@@ -108,10 +107,10 @@ def replay(spec_path: Path, sensor_csv: Path, metrics: str) -> None:
 
     runner = asyncio.run(run_scenario(spec_path, sensor_csv, metrics=metric_list))
 
-    total = sum(len(a.log) for a in runner.actuators.values())
+    total = sum(len(a.history) for a in runner.actuators.values())
     click.echo(f"\nReplay complete. {total} actuator state change(s) logged.")
     for name, actuator in runner.actuators.items():
-        click.echo(f"  {name}: {len(actuator.log)} transition(s)")
+        click.echo(f"  {name}: {len(actuator.history)} transition(s)")
 
 
 @grow.command("status")
