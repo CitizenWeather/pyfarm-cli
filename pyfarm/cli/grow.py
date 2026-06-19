@@ -30,13 +30,30 @@ def validate(spec_path: Path) -> None:
 
 @grow.command("start")
 @click.argument("spec_path", type=click.Path(exists=True, path_type=Path))
-@click.option("--chamber", default=None, help="Chamber identifier (future: loads sensor config)")
+@click.option("--chamber", default=None, help="Environment profile to load (profiles/<chamber>.env)")
 @click.option("--tick", default=10, show_default=True, help="Control loop interval in seconds")
 @click.option("--api-port", default=None, type=int, help="Expose live status API on this port")
-def start(spec_path: Path, chamber: str | None, tick: int, api_port: int | None) -> None:
+@click.option("--db", "db_path", default=None, type=click.Path(path_type=Path), help="Persist run history to this SQLite file")
+def start(spec_path: Path, chamber: str | None, tick: int, api_port: int | None, db_path: Path | None) -> None:
     """Start a grow run from a GrowSpec YAML file."""
+    from pyfarm.core.config import load_profile
+
+    # A chamber selects an environment profile (secrets/credentials) *before*
+    # the spec is loaded, so ${VAR} references in the spec resolve against it.
+    if chamber:
+        try:
+            load_profile(chamber)
+        except FileNotFoundError as e:
+            click.echo(f"Error: {e}", err=True)
+            raise SystemExit(1)
+
     from pyfarm.control.spec.loader import load_spec, SpecValidationError
-    from pyfarm.control.extensions import build_actuator, build_notifiers, build_alert_evaluator
+    from pyfarm.control.extensions import (
+        build_actuator,
+        build_alert_evaluator,
+        build_notifiers,
+        build_sensor,
+    )
     from pyfarm.control.engine.runner import ControlRunner
 
     try:
@@ -54,6 +71,15 @@ def start(spec_path: Path, chamber: str | None, tick: int, api_port: int | None)
         click.echo(f"API:     http://127.0.0.1:{api_port}/status")
 
     try:
+        sensors = [
+            build_sensor(name, sensor_spec)
+            for name, sensor_spec in spec.sensors.items()
+        ]
+    except ValueError as e:
+        click.echo(f"Error building sensors: {e}", err=True)
+        raise SystemExit(1)
+
+    try:
         actuators = {
             name: build_actuator(name, actuator_spec)
             for name, actuator_spec in spec.actuators.items()
@@ -61,6 +87,16 @@ def start(spec_path: Path, chamber: str | None, tick: int, api_port: int | None)
     except ValueError as e:
         click.echo(f"Error building actuators: {e}", err=True)
         raise SystemExit(1)
+
+    store = None
+    if db_path is not None:
+        from pyfarm.control.persist import SQLiteStore
+
+        store = SQLiteStore(db_path)
+        click.echo(f"DB:      {db_path}")
+
+    if sensors:
+        click.echo(f"Sensors: {', '.join(s.metric for s in sensors)}")
 
     channels = build_notifiers(spec.notifications)
     alert_evaluator = build_alert_evaluator(channels, spec)
@@ -70,9 +106,10 @@ def start(spec_path: Path, chamber: str | None, tick: int, api_port: int | None)
 
     runner = ControlRunner(
         spec=spec,
-        sensors=[],
+        sensors=sensors,
         actuators=actuators,
         alert_evaluator=alert_evaluator,
+        store=store,
         tick_seconds=tick,
         api_port=api_port,
     )
