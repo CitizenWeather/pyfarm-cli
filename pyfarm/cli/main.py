@@ -1,5 +1,8 @@
 import click
+
+from .cultivars import cultivars
 from .grow import grow
+from .protocols import protocols
 
 
 @click.group()
@@ -9,3 +12,5 @@ def cli():
 
 
 cli.add_command(grow)
+cli.add_command(cultivars)
+cli.add_command(protocols)
